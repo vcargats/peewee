@@ -124,6 +124,174 @@ class APSWDatabase(SqliteExtDatabase):
         return savepoint(self, sid)
 
 
+class TableFunction(object):
+    columns = None
+    parameters = None
+    name = None
+
+    @classmethod
+    def get_columns(cls):
+        if cls.columns is None:
+            raise ValueError('No columns defined.')
+        return cls.columns
+
+    @classmethod
+    def get_parameters(self):
+        if cls.parameters is None:
+            raise ValueError('No parameters defined.')
+        return cls.parameters
+
+    def initialize(self, **query):
+        raise NotImplementedError
+
+    def iterate(self, idx):
+        raise NotImplementedError
+
+    @classmethod
+    def module(cls):
+        module = type('%sModule' % cls.__name__, (BaseModule,), {})
+        return module(cls)
+
+
+class Cursor(object):
+    def __init__(self, table_func):
+        self.table_func = table_func
+        self.current_row = None
+        self._idx = 0
+        self._consumed = False
+
+    def Close(self):
+        pass
+
+    def Column(self, idx):
+        if idx == -1:
+            return self._idx
+        return self.current_row[idx - 1]
+
+    def Eof(self):
+        return self._consumed
+
+    def Filter(self, idx_num, idx_name, constraint_args):
+        """
+        This method is always called first to initialize an iteration
+        to the first row of the table. The arguments come from the
+        BestIndex() method in the table object with constraintargs
+        being a tuple of the constraints you requested. If you always
+        return None in BestIndex then indexnum will be zero,
+        indexstring will be None and constraintargs will be empty).
+        """
+        query = {}
+        params = idx_name.split(',')
+        for idx, param in enumerate(params):
+            value = constraint_args[idx]
+            query[param] = value
+
+        self.table_func.initialize(**query)
+        self.Next()
+
+    def Next(self):
+        try:
+            self.current_row = self.table_func.iterate(self._idx)
+        except StopIteration:
+            self._consumed = True
+        else:
+            self._idx += 1
+
+    def Rowid(self):
+        return self._idx
+
+
+class Table(object):
+    def __init__(self, table_func, params):
+        self.table_func = table_func
+        self.params = params
+
+    def Open(self):
+        return Cursor(self.table_func())
+
+    def Disconnect(self):
+        pass
+
+    Destroy = Disconnect
+
+    def UpdateChangeRow(self, *args):
+        raise ValueError('Cannot modify eponymous virtual table.')
+
+    UpdateDeleteRow = UpdateInsertRow = UpdateChangeRow
+
+    def BestIndex(self, constraints, order_bys):
+        """
+        Example query:
+
+        SELECT * FROM redis_tbl
+        WHERE parent = 'my-hash' AND type = 'hash';
+
+        Since parent is column 4 and type is colum 3, the constraints
+        will be:
+
+        (4, apsw.SQLITE_INDEX_CONSTRAINT_EQ),
+        (3, apsw.SQLITE_INDEX_CONSTRAINT_EQ)
+
+        Ordering will be a list of 2-tuples consisting of the column
+        index and boolean for descending.
+
+        Return values are:
+
+        * Constraints used, which for each constraint, must be either
+          None, an integer (the argument number for the constraints
+          passed into the Filter() method), or (int, bool) tuple.
+        * Index number (default zero).
+        * Index string (default None).
+        * Boolean whether output will be in same order as the ordering
+          specified.
+        * Estimated cost in disk operations.
+        """
+        constraints_used = []
+        columns = []
+        for i, (column_idx, comparison) in enumerate(constraints):
+            if comparison != apsw.SQLITE_INDEX_CONSTRAINT_EQ:
+                continue
+
+            # Instruct SQLite to pass the constraint value to the
+            # Cursor's Filter() method.
+            constraints_used.append(i)
+
+            # We will generate a string containing the columns being
+            # filtered on, otherwise our Cursor won't know which
+            # columns the filter values correspond to.
+            columns.append(self.params[column_idx - 1])
+
+        return [
+            constraints_used,  # Indices of constraints we are
+                               # interested in.
+            0,  # The index number, not used by us.
+            ','.join(columns),  # The index name, a list of filter
+                                # columns.
+            False,  # Whether the results are ordered.
+            1000,
+        ]
+
+
+class BaseModule(object):
+    def __init__(self, table_func):
+        self.table_func = table_func
+
+    def Connect(self, connection, module_name, db_name, table_name,
+                *args):
+        # Retrieve the cols and params from the TableFunction.
+        columns = self.table_func.get_columns()
+        parameters = self.table_func.get_parameters()
+
+        columns = ','.join(
+            columns +
+            ['%s HIDDEN' % param for param in parameters])
+
+        return ('CREATE TABLE x(%s);' % columns,
+                Table(self.table_func, parameters))
+
+    Create = Connect
+
+
 def nh(s, v):
     if v is not None:
         return str(v)
